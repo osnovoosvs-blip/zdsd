@@ -1,0 +1,128 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack zip archives (if pom.xml is missing)
+        run: |
+          if [ -z "$(find . -name pom.xml -not -path './.git/*' | head -n 1)" ]; then
+            mkdir -p _unpacked
+            find . -iname '*.zip' -not -path './.git/*' -not -path './_unpacked/*' -print0 |
+              while IFS= read -r -d '' z; do
+                echo "Unpacking: $z"
+                unzip -oq "$z" -d _unpacked || echo "::warning::Cannot unpack $z"
+              done
+          fi
+
+      - name: Locate project
+        id: locate
+        run: |
+          POM=$(find . -name pom.xml -not -path './.git/*' -not -path '*/target/*' | awk '{print length($0) " " $0}' | sort -n | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$POM" ]; then
+            echo "::error::pom.xml not found. Upload project folder contents (pom.xml, src/) to the repository."
+            find . -not -path './.git/*' | head -n 80
+            exit 1
+          fi
+          DIR=$(dirname "$POM")
+          echo "Project dir: $DIR"
+          [ -d "$DIR/src" ] || echo "::warning::No src/ next to pom.xml"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: ${{ steps.locate.outputs.dir }}/pom.xml
+
+      - name: Build with Maven
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          ok=0
+          for attempt in 1 2 3; do
+            echo "::group::Maven attempt $attempt of 3"
+            if mvn -B -ntp -DskipTests clean package 2>&1 | tee "$LOG"; then
+              ok=1
+            fi
+            echo "::endgroup::"
+            if [ "$ok" = 1 ]; then
+              break
+            fi
+            if grep -q "COMPILATION ERROR" "$LOG"; then
+              echo "::error::Compilation error in code - retry will not help."
+              break
+            fi
+            if grep -qiE "Could not transfer artifact|Connection (reset|timed out)|Read timed out|Premature end of Content-Length|Temporary failure in name resolution|status: 5[0-9][0-9]|Failed to read artifact descriptor|Could not resolve dependencies" "$LOG"; then
+              echo "::warning::Network error, retrying in 15 sec..."
+              sleep 15
+            else
+              break
+            fi
+          done
+          if [ "$ok" != 1 ]; then
+            grep -E "^\[ERROR\]" "$LOG" | head -n 25 >> "$GITHUB_STEP_SUMMARY" || true
+            exit 1
+          fi
+
+      - name: Verify jar
+        id: verify
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          JAR=$(find target -maxdepth 1 -name '*.jar' ! -name 'original-*' ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -n 1)
+          if [ -z "$JAR" ]; then
+            echo "::error::Jar not found in target/"
+            ls -la target || true
+            exit 1
+          fi
+          echo "Jar: $JAR"
+          if ! unzip -l "$JAR" | grep -qE ' plugin\.yml$'; then
+            echo "::error::plugin.yml is missing in jar (check src/main/resources)"
+            exit 1
+          fi
+          MAIN=$(unzip -p "$JAR" plugin.yml | tr -d '\r' | grep -E '^main:' | head -n 1 | sed -E "s/^main:[[:space:]]*['\"]?([^'\"[:space:]]+).*/\1/")
+          if [ -z "$MAIN" ]; then
+            echo "::error::main is not set in plugin.yml"
+            exit 1
+          fi
+          CLASS="${MAIN//.//}.class"
+          if ! unzip -l "$JAR" | grep -qE " ${CLASS}\$"; then
+            echo "::error::Main class $MAIN not found in jar"
+            exit 1
+          fi
+          echo "jar=$PWD/$JAR" >> "$GITHUB_OUTPUT"
+          echo "Built: $(basename "$JAR"), main: $MAIN" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plugin jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-jar
+          path: ${{ steps.verify.outputs.jar }}
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
